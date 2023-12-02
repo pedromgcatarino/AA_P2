@@ -5,55 +5,12 @@ import optuna
 from sklearn.preprocessing import StandardScaler
 from sklearn.manifold import Isomap
 from sklearn.impute import KNNImputer
+from sklearn.impute import SimpleImputer
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
 from sklearn.model_selection import ShuffleSplit
+from sklearn.feature_selection import SelectKBest, f_classif
 import xgboost as xgb
-
-
-def cMSE(y_hat, y, c):
-    err = y - y_hat
-    err = (1 - c) * err ** 2 + c * np.maximum(0, err) ** 2
-    return np.sum(err) / err.shape[0]
-
-data = pd.read_csv('./train_data.csv', index_col=0)
-
-x = data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
-
-#scaler = StandardScaler()
-#x = scaler.fit_transform(x)
-
-# Missing values imputation
-imputer = KNNImputer(n_neighbors=5, weights="distance")
-X = pd.DataFrame(imputer.fit_transform(x), columns=['Age', 'Gender', 'Stage', 'GeneticRisk', 'TreatmentType', 'ComorbidityIndex', 'TreatmentResponse'])
-data[X.columns] = X
-
-# Split the data into labeled and unlabeled DataFrames
-labeled_data = data.dropna(subset=['SurvivalTime'])
-#unlabeled_data = data[data['SurvivalTime'].isna()]
-
-labeled_lower_bound = labeled_data['SurvivalTime'].to_numpy()
-labeled_upper_bound = np.where(labeled_data['Censored'] == 1, +np.inf, labeled_data['SurvivalTime'])
-
-labeledX = labeled_data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
-
-# For the unlabeled data, we only have features
-#unlabeledX = unlabeled_data.drop(columns=['SurvivalTime', 'Censored'])
-iso = Isomap(n_components=6)
-iso.fit(X.to_numpy())
-Z = iso.transform(labeledX)
-# splitting
-rs = ShuffleSplit(n_splits=2, test_size=.5, random_state=0)
-train_indexes, valid_indexes = next(rs.split(labeledX))
-dtrain = xgb.DMatrix(labeledX[train_indexes, :])
-dtrain.set_float_info('label_lower_bound', labeled_lower_bound[train_indexes])
-dtrain.set_float_info('label_upper_bound', labeled_upper_bound[train_indexes])
-dvalid = xgb.DMatrix(labeledX[valid_indexes, :])
-dvalid.set_float_info('label_lower_bound', labeled_lower_bound[valid_indexes])
-dvalid.set_float_info('label_upper_bound', labeled_upper_bound[valid_indexes])
-
-base_params = {'verbosity': 0,
-              'objective': 'survival:aft',
-              'eval_metric': 'aft-nloglik',
-              'tree_method': 'hist'}  # Hyperparameters common to all trials
 
 def objective(trial):
     params = {'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 1.0),
@@ -66,40 +23,100 @@ def objective(trial):
     params.update(base_params)
     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, 'valid-aft-nloglik')
     bst = xgb.train(params, dtrain, num_boost_round=10000,
-                    evals=[(dtrain, 'train'), (dvalid, 'valid')],
+                    evals=[(dtrain, 'train'), (dvalid,'valid')],
                     early_stopping_rounds=50, verbose_eval=False, callbacks=[pruning_callback])
     if bst.best_iteration >= 25:
         return bst.best_score
     else:
         return np.inf  # Reject models with < 25 trees
+def cMSE(y_hat, y, c):
+    err = y - y_hat
+    err = (1 - c) * err ** 2 + c * np.maximum(0, err) ** 2
+    return np.sum(err) / err.shape[0]
 
-# Run hyperparameter search
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=200)
-print('Completed hyperparameter tuning with best aft-nloglik = {}.'.format(study.best_trial.value))
-params = {}
-params.update(base_params)
-params.update(study.best_trial.params)
+data = pd.read_csv('./train_data.csv', index_col=0)
 
-# Re-run training with the best hyperparameter combination
-print('Re-running the best trial... params = {}'.format(params))
-bst = xgb.train(params, dtrain, num_boost_round=10000,
-                evals=[(dtrain, 'train'), (dvalid, 'valid')],
-                early_stopping_rounds=50)
+inputers = [KNNImputer(n_neighbors=5,weights="distance"), SimpleImputer(), IterativeImputer()]
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# Run prediction on the validation set
-pred = bst.predict(dvalid)
-df = pd.DataFrame({'TARGET': pred})
+# Missing values imputation
+for nr in range(1 , 8):
+    selector = SelectKBest(score_func=f_classif, k=nr)
+    for y in range(3):
 
-c = np.isinf(labeled_upper_bound[valid_indexes]).astype(int)
-error = cMSE(pred, labeled_lower_bound[valid_indexes], c)
-print(df)
-print(error)
-
-testData = pd.read_csv('./test_data.csv', index_col=0)
-test = xgb.DMatrix(testData)
-testPred = bst.predict(test)
-t = pd.DataFrame({'TARGET': testPred})
+        x = data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
+        scaler = StandardScaler()
+        x = scaler.fit_transform(x)
+        X = pd.DataFrame(inputers[y].fit_transform(x), columns=['Age', 'Gender', 'Stage', 'GeneticRisk', 'TreatmentType' , 'ComorbidityIndex', 'TreatmentResponse'])
+        data[X.columns] = X
 
 
-t.to_csv('prediction.csv')
+        # Split the data into labeled and unlabeled DataFrames
+        labeled_data = data.dropna(subset=['SurvivalTime'])
+        #unlabeled_data = data[data['SurvivalTime'].isna()]
+
+        labeled_lower_bound = labeled_data['SurvivalTime'].to_numpy()
+        labeled_upper_bound = np.where(labeled_data['Censored'] == 1, 100 - labeled_data['Age'], labeled_data['SurvivalTime'])
+
+        labeledX = labeled_data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
+
+        # For the unlabeled data, we only have features
+        rs = ShuffleSplit(n_splits=2, test_size=.5, random_state=0)
+        train_indexes, valid_indexes = next(rs.split(labeledX))
+
+
+        x = (labeled_upper_bound + labeled_lower_bound) / 2
+        X_train_selected = selector.fit_transform(labeledX[train_indexes, :], x[train_indexes])
+        X_test_selected = selector.transform(labeledX[valid_indexes, :])
+
+
+        dtrain = xgb.DMatrix(X_train_selected)
+        dtrain.set_float_info('label_lower_bound', labeled_lower_bound[train_indexes])
+        dtrain.set_float_info('label_upper_bound', labeled_upper_bound[train_indexes])
+        dvalid = xgb.DMatrix(X_test_selected)
+        dvalid.set_float_info('label_lower_bound', labeled_lower_bound[valid_indexes])
+        dvalid.set_float_info('label_upper_bound', labeled_upper_bound[valid_indexes])
+
+
+        base_params = {'verbosity': 0,
+                      'objective': 'survival:aft',
+                      'eval_metric': 'aft-nloglik',
+                      'tree_method': 'hist'}  # Hyperparameters common to all trials
+
+
+
+        # Run hyperparameter search
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=200, show_progress_bar=False)
+        #print('Completed hyperparameter tuning with best aft-nloglik = {}.'.format(study.best_trial.value))
+        params = {}
+        params.update(base_params)
+        params.update(study.best_trial.params)
+
+        # Re-run training with the best hyperparameter combination
+        #print('Re-running the best trial... params = {}'.format(params))
+        bst = xgb.train(params, dtrain, num_boost_round=10000,
+                        evals=[(dtrain, 'train'), (dvalid, 'valid')],
+                        early_stopping_rounds=50,verbose_eval=False)
+
+        # Run prediction on the validation set
+        pred = bst.predict(dvalid)
+        df = pd.DataFrame({'TARGET': pred})
+
+        c = np.where(labeled_upper_bound[valid_indexes] != labeled_lower_bound[valid_indexes], 1 , 0)
+        error = cMSE(pred, labeled_lower_bound[valid_indexes], c)
+        #print(df)
+        print(f"Error with inputer:{y} with nrK:{nr}: {error}")
+
+
+        testData = pd.read_csv('./test_data.csv', index_col=0).to_numpy()
+        Xtest = pd.DataFrame(inputers[y].fit_transform(testData),
+                         columns=['Age', 'Gender', 'Stage', 'GeneticRisk', 'TreatmentType', 'ComorbidityIndex',
+                                  'TreatmentResponse'])
+        test = selector.transform(Xtest)
+        testf = xgb.DMatrix(test)
+        testPred = bst.predict(testf)
+        t = pd.DataFrame({'TARGET': testPred})
+
+
+        t.to_csv(f'prediction_{y}_{nr}.csv')
