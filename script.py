@@ -6,7 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold
 from sklearn.manifold import Isomap
 from sklearn.impute import KNNImputer
-from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.linear_model import LinearRegression, Ridge
 
 from sklearn.decomposition import PCA, KernelPCA
 
@@ -69,7 +69,7 @@ for nf in range(1, 8):
     testData1 = scaler.transform(testData)
 
     # IMPUTING
-    imputer = KNNImputer(n_neighbors=3, weights="uniform")
+    imputer = KNNImputer(n_neighbors=3, weights="distance")
     imputer.fit(x)
     x1 = imputer.transform(x)
     X2 = imputer.transform(X1)
