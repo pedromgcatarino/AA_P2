@@ -42,7 +42,7 @@ data = pd.read_csv('./train_data.csv', index_col=0)
 testData = pd.read_csv('./test_data.csv', index_col=0).to_numpy()
 
 #inputers = [KNNImputer(n_neighbors=8, weights="uniform"), SimpleImputer(), IterativeImputer()]
-#models = [LinearRegression(), Ridge(alpha=10, solver='cholesky', tol=0.00001), KNeighborsRegressor(n_neighbors=7)]
+#models = [LinearRegression(), Ridge(alpha=1.0, solver='cholesky', tol=0.00001), KNeighborsRegressor(n_neighbors=7)]
 
 x = data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
 
@@ -78,29 +78,29 @@ for nf in range(1, 8):
     # PCA
     Xc = X2 - np.mean(X2, axis=0)
     pca = PCA(n_components=nf)
-    # pca.fit(x)
+    # pca.fit(x1)
     Xc = pca.fit_transform(Xc)
 
     Xt = testData2 - np.mean(testData2, axis=0)
-    Xt = pca.fit_transform(Xt)
+    Xt = pca.transform(Xt)
 
     # Kernel PCA
     Xc1 = X2 - np.mean(X2, axis=0)
-    transformer = KernelPCA(n_components=nf, kernel='rbf', eigen_solver='dense')
-    # transformer.fit(x)
-    Xc1 = transformer.fit_transform(Xc1)
+    kpca = KernelPCA(n_components=nf, kernel='rbf', eigen_solver='dense')
+    #kpca.fit(x1)
+    Xc1 = kpca.fit_transform(Xc1)
 
     Xt1 = testData2 - np.mean(testData2, axis=0)
-    Xt1 = transformer.fit_transform(Xt1)
+    Xt1 = kpca.transform(Xt1)
 
     # ISOMAP
     Xc2 = X2 - np.mean(X2, axis=0)
-    embedding = Isomap(n_components=nf)
-    # embedding.fit(x)
-    Xc2 = embedding.fit_transform(Xc2)
+    isomap = Isomap(n_components=nf)
+    # isomap.fit(x1)
+    Xc2 = isomap.fit_transform(Xc2)
 
     Xt2 = testData2 - np.mean(testData2, axis=0)
-    Xt2 = embedding.fit_transform(Xt2)
+    Xt2 = isomap.transform(Xt2)
 
     # SELECT K BEST
     Xb = np.append(Xc, Xc1, axis=1)
@@ -112,7 +112,6 @@ for nf in range(1, 8):
     skb = SelectKBest(k=nf)
     Xb = skb.fit_transform(Xb, y)
     finaltestData = skb.transform(Xtt)
-
 
     # CROSS-VALIDATION
     n_folds = 20
