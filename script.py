@@ -1,122 +1,90 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-import optuna
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.manifold import Isomap
 from sklearn.impute import KNNImputer
 from sklearn.impute import SimpleImputer
 from sklearn.experimental import enable_iterative_imputer
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.impute import IterativeImputer
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import ShuffleSplit
 from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.decomposition import PCA
 import xgboost as xgb
-
-def objective(trial):
-    params = {'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 1.0),
-              'aft_loss_distribution': trial.suggest_categorical('aft_loss_distribution',
-                                                                  ['normal', 'logistic', 'extreme']),
-              'aft_loss_distribution_scale': trial.suggest_loguniform('aft_loss_distribution_scale', 0.1, 10.0),
-              'max_depth': trial.suggest_int('max_depth', 3, 8),
-              'lambda': trial.suggest_loguniform('lambda', 1e-8, 1.0),
-              'alpha': trial.suggest_loguniform('alpha', 1e-8, 1.0)}  # Search space
-    params.update(base_params)
-    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, 'valid-aft-nloglik')
-    bst = xgb.train(params, dtrain, num_boost_round=10000,
-                    evals=[(dtrain, 'train'), (dvalid,'valid')],
-                    early_stopping_rounds=50, verbose_eval=False, callbacks=[pruning_callback])
-    if bst.best_iteration >= 25:
-        return bst.best_score
-    else:
-        return np.inf  # Reject models with < 25 trees
 def cMSE(y_hat, y, c):
     err = y - y_hat
     err = (1 - c) * err ** 2 + c * np.maximum(0, err) ** 2
     return np.sum(err) / err.shape[0]
 
+def calc_fold(X,Y, c, train_ix,valid_ix, pipe):
+    pipe.fit(X[train_ix], Y[train_ix])
+
+    trainPred = pipe.predict(X[train_ix])
+    trainError = cMSE(trainPred, Y[train_ix], c[train_ix])
+    pred = pipe.predict(X[valid_ix])
+    error = cMSE(pred, Y[valid_ix], c[valid_ix])
+    return error, trainError
+
 data = pd.read_csv('./train_data.csv', index_col=0)
 
-inputers = [KNNImputer(n_neighbors=5,weights="distance"), SimpleImputer(), IterativeImputer()]
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+inputers = [KNNImputer(n_neighbors=8, weights="uniform"), SimpleImputer(), IterativeImputer()]
+models = [LinearRegression(), Ridge(alpha=10), KNeighborsRegressor(n_neighbors=7)]
 
-# Missing values imputation
-for nr in range(1 , 8):
-    selector = SelectKBest(score_func=f_classif, k=nr)
-    for y in range(3):
+testData = pd.read_csv('./test_data.csv', index_col=0).to_numpy()
 
-        x = data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
-        scaler = StandardScaler()
-        x = scaler.fit_transform(x)
-        X = pd.DataFrame(inputers[y].fit_transform(x), columns=['Age', 'Gender', 'Stage', 'GeneticRisk', 'TreatmentType' , 'ComorbidityIndex', 'TreatmentResponse'])
-        data[X.columns] = X
+x = data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
 
+labeled_data = data.dropna(subset=['SurvivalTime'])
 
-        # Split the data into labeled and unlabeled DataFrames
-        labeled_data = data.dropna(subset=['SurvivalTime'])
-        #unlabeled_data = data[data['SurvivalTime'].isna()]
+y = labeled_data['SurvivalTime'].to_numpy()
+c = labeled_data['Censored'].to_numpy()
+X = labeled_data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
 
-        labeled_lower_bound = labeled_data['SurvivalTime'].to_numpy()
-        labeled_upper_bound = np.where(labeled_data['Censored'] == 1, 100 - labeled_data['Age'], labeled_data['SurvivalTime'])
+best_err = 100
+best_n = 0
+best_p = 0
+best_alpha = 0
+for nn in range(1, 8):
+    for nc in range(1, 8):
+        for a in range(1, 10):
+            alpha = a/10.0
+            pipe = make_pipeline( KNNImputer(n_neighbors=nn, weights="uniform"), StandardScaler(), PCA(n_components=nc),
+                                 Ridge(alpha=alpha))
 
-        labeledX = labeled_data.drop(columns=['SurvivalTime', 'Censored']).to_numpy()
+            n_folds = 12
+            kf = KFold(n_splits=n_folds)
+            error = 0
+            trainError = 0
+            for train_ix, valid_ix in kf.split(X):
+                err, trainErr = calc_fold(X, y, c, train_ix, valid_ix, pipe)
+                error = error + err
+                trainError = trainError + trainErr
 
-        # For the unlabeled data, we only have features
-        rs = ShuffleSplit(n_splits=2, test_size=.5, random_state=0)
-        train_indexes, valid_indexes = next(rs.split(labeledX))
+            error = error / n_folds
+            trainError = trainError / n_folds
+            if error < best_err:
+                best_err = error
+                best_n = nn
+                best_p = nc
+                best_alpha = alpha
+                test = pipe.predict(testData)
+                t = pd.DataFrame({'TARGET': test})
+                t.to_csv(f'prediction_{nn}_{nc}_{alpha}.csv')
 
-
-        x = (labeled_upper_bound + labeled_lower_bound) / 2
-        X_train_selected = selector.fit_transform(labeledX[train_indexes, :], x[train_indexes])
-        X_test_selected = selector.transform(labeledX[valid_indexes, :])
-
-
-        dtrain = xgb.DMatrix(X_train_selected)
-        dtrain.set_float_info('label_lower_bound', labeled_lower_bound[train_indexes])
-        dtrain.set_float_info('label_upper_bound', labeled_upper_bound[train_indexes])
-        dvalid = xgb.DMatrix(X_test_selected)
-        dvalid.set_float_info('label_lower_bound', labeled_lower_bound[valid_indexes])
-        dvalid.set_float_info('label_upper_bound', labeled_upper_bound[valid_indexes])
-
-
-        base_params = {'verbosity': 0,
-                      'objective': 'survival:aft',
-                      'eval_metric': 'aft-nloglik',
-                      'tree_method': 'hist'}  # Hyperparameters common to all trials
-
-
-
-        # Run hyperparameter search
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=200, show_progress_bar=False)
-        #print('Completed hyperparameter tuning with best aft-nloglik = {}.'.format(study.best_trial.value))
-        params = {}
-        params.update(base_params)
-        params.update(study.best_trial.params)
-
-        # Re-run training with the best hyperparameter combination
-        #print('Re-running the best trial... params = {}'.format(params))
-        bst = xgb.train(params, dtrain, num_boost_round=10000,
-                        evals=[(dtrain, 'train'), (dvalid, 'valid')],
-                        early_stopping_rounds=50,verbose_eval=False)
-
-        # Run prediction on the validation set
-        pred = bst.predict(dvalid)
-        df = pd.DataFrame({'TARGET': pred})
-
-        c = np.where(labeled_upper_bound[valid_indexes] != labeled_lower_bound[valid_indexes], 1 , 0)
-        error = cMSE(pred, labeled_lower_bound[valid_indexes], c)
-        #print(df)
-        print(f"Error with inputer:{y} with nrK:{nr}: {error}")
+            print("CV ERROR FOR N_NEIGHBORS: " + str(nn) + " N_COMPONENTS: " + str(nc) + " ALPHA: " + str(alpha))
+            print(error)
+            print("TRAINING ERROR:")
+            print(trainError)
 
 
-        testData = pd.read_csv('./test_data.csv', index_col=0).to_numpy()
-        Xtest = pd.DataFrame(inputers[y].fit_transform(testData),
-                         columns=['Age', 'Gender', 'Stage', 'GeneticRisk', 'TreatmentType', 'ComorbidityIndex',
-                                  'TreatmentResponse'])
-        test = selector.transform(Xtest)
-        testf = xgb.DMatrix(test)
-        testPred = bst.predict(testf)
-        t = pd.DataFrame({'TARGET': testPred})
 
-
-        t.to_csv(f'prediction_{y}_{nr}.csv')
+print("BEST ERROR: " + str(best_err))
+print("BEST N: " + str(best_n))
+print("BEST C: " + str(best_p))
+print("BEST ALPHA: " + str(best_alpha))
